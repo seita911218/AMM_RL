@@ -1,0 +1,10 @@
+{
+    "pool_address":"0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+    "chain":"eth",
+    "token0":"WETH",
+    "token1":"USDC",
+    "decimal_0":"18",
+    "decimal_1":"6",
+    "fee_tier":"0.0005",
+    "tickspacing":"10"
+  }
