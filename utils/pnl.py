@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import math
 import json
 import os
@@ -146,5 +147,6 @@ if __name__ == "__main__":
     data_path = os.path.dirname(os.path.abspath(__file__)) + '/..' + '/data'
     data = pd.read_csv(data_path + '/organized_hourly_data.csv')
     gas = 5
-    result = pnl(data gas)
+    L = int(2.6162685701074442e+17)
+    result = pnl(data,L, gas)
     result.to_csv(data_path + "/pnl.csv")
