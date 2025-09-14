@@ -1,38 +1,117 @@
 # ==== Best-trial loader + rollout (self-contained; saves to result/<trial_name>/) ====
-# Requirements in your session: numpy, pandas, torch, and your utils.env.UniswapV3LiquidityEnv.
+# Requirements: numpy, pandas, torch, and your utils.env[2].UniswapV3LiquidityEnv.
 
-import os, json, glob, shutil
+import os, json, glob, shutil, sys, inspect, math
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 
+# Optional: bridge gymnasium -> gym to avoid version mismatch during env import
+try:
+    import gymnasium as _gym  # noqa
+    sys.modules.setdefault("gym", _gym)
+except Exception:
+    pass
+
+
+# ===== Env loader & kwargs filtering =====
+
+def _get_env_class():
+    """
+    Prefer utils.env2.UniswapV3LiquidityEnv if available, else utils.env.UniswapV3LiquidityEnv.
+    Also returns the module object so we can access module-level constants (e.g., decimal_0/1).
+    """
+    from utils.env import UniswapV3LiquidityEnv as Env
+    import utils.env as env_mod
+    return Env, env_mod, "utils.env"
+
+# Static fallback list (used only if dynamic inspection fails)
+ENV_INIT_KEYS_FALLBACK = {
+    "numeric_data", "time_data",
+    "init_value", "liquidation_value",
+    "total_liquidity",        # for older envs
+    "gas_cost", "fee_tier",
+    "max_steps", "max_step",  # some envs use max_step
+    "start_index",
+}
+
+def _env_init_kw(d: dict) -> dict:
+    """
+    Build kwargs for UniswapV3LiquidityEnv dynamically:
+    - Keep only keys present in the env __init__ signature.
+    - Map new->old names when needed:
+        init_value -> total_liquidity (if env expects total_liquidity)
+        max_steps  -> max_step        (if env expects max_step)
+    """
+    try:
+        Env, _, _ = _get_env_class()
+        params = set(inspect.signature(Env.__init__).parameters.keys())
+        params.discard("self")
+
+        out = {k: d[k] for k in d.keys() if k in params}
+
+        # Remap: init_value -> total_liquidity
+        if "init_value" in d and "init_value" not in params and "total_liquidity" in params and "total_liquidity" not in out:
+            out["total_liquidity"] = d["init_value"]
+
+        # Remap: max_steps -> max_step
+        if "max_steps" in d and "max_steps" not in params and "max_step" in params and "max_step" not in out:
+            out["max_step"] = d["max_steps"]
+
+        return out
+    except Exception:
+        # Fallback to static whitelist if inspection fails
+        return {k: d[k] for k in d.keys() if k in ENV_INIT_KEYS_FALLBACK}
+
+def _probe_env_dims(env_kw: dict) -> tuple[int, int]:
+    """Instantiate env once to get true obs_dim (flattened) and action_dim."""
+    Env, _, _ = _get_env_class()
+    env = Env(**_env_init_kw(env_kw))
+
+    s0 = env.reset()
+    if isinstance(s0, tuple):  # (obs, info)
+        s0 = s0[0]
+    s0 = np.asarray(s0, dtype=np.float32)
+    obs_dim = int(np.prod(s0.shape))
+
+    act_dim = 5
+    if hasattr(env, "action_space") and hasattr(env.action_space, "n"):
+        act_dim = int(env.action_space.n)
+
+    try:
+        env.close()
+    except Exception:
+        pass
+    return obs_dim, act_dim
+
+
 #####################################################################################################################################
 # DQN
 #####################################################################################################################################
 
 # --- Helper A) Locate experiment directory (Ray Tune results) ---
-def _find_experiment_dir(explicit: str | Path | None = None) -> Path:
+def _find_experiment_dir(explicit: str | Path | None) -> Path:
     """
-    Return the path to the Ray Tune experiment directory containing trial folders.
-    Tries (1) explicit, (2) common local paths.
+    REQUIRE an explicit path chosen by the user.
+    Accepts either:
+      - the top-level experiment directory containing many trials, or
+      - a single trial directory, or
+      - a direct path to progress.csv / result.json (will use its parent dir).
     """
-    if explicit:
-        p = Path(explicit).expanduser().resolve()
-        if p.exists():
-            return p
-        raise FileNotFoundError(f"Experiment dir not found: {p}")
+    if explicit is None:
+        raise ValueError("Please pass experiment_dir=... (absolute or relative path). No fallback candidates are used.")
+    p = Path(explicit).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Experiment path does not exist: {p}")
 
-    candidates = [
-        Path("./ray_results/dqn_univ3_search").resolve(),
-        Path("./experiments/ray_results/dqn_univ3_search").resolve(),
-        Path("/Users/seitahuang/Desktop/AMM_RL/experiments/ray_results/dqn_univ3_search").resolve(),  # adjust if needed
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError("Experiment directory not found. Set an explicit path or adjust candidates.")
+    if p.is_file():
+        if p.name in ("progress.csv", "result.json"):
+            return p.parent
+        raise FileNotFoundError(f"Expected a directory or a Ray log file (progress.csv/result.json), got file: {p}")
+
+    return p
 
 # --- Helper B) Pick the best trial directory by maximum cum_return_max ---
 def _pick_best_trial(exp_dir: Path) -> tuple[Path, float]:
@@ -54,7 +133,7 @@ def _pick_best_trial(exp_dir: Path) -> tuple[Path, float]:
         except Exception:
             pass
 
-    # Fallback: scan result.json lines
+    # Fallback: scan result.json lines (newline-delimited JSON)
     if best_dir is None:
         for js in exp_dir.rglob("result.json"):
             try:
@@ -116,6 +195,18 @@ def _build_cfg_for_inference(best_trial_dir: Path, env_class, state_dim: int, ac
     cfg.net_dims = tuple(net_dims)
     cfg.gpu_id = 0 if torch.cuda.is_available() else -1
     cfg.cwd = str(cwd_dir)
+
+    # Helpful extras for compatibility
+    try:
+        cfg.if_discrete = True
+    except Exception:
+        pass
+    cfg.env_num = 1
+    try:
+        # max_step is not strictly required for inference, but set for completeness
+        cfg.max_step = int(1)
+    except Exception:
+        pass
     return cfg
 
 # --- Helper E) Robust DQN actor loader (prefers actor_latest.pth) ---
@@ -128,8 +219,8 @@ def load_dqn_actor(cfg, checkpoint_path: str | None = None):
     Searches cfg.cwd recursively, preferring actor_latest.pth, then actor.pth/pt, then actor__*.pt.
     """
     from elegantrl.agents.AgentDQN import AgentDQN
-    device = torch.device('cpu' if cfg.gpu_id < 0 else 'cuda')
-    agent  = AgentDQN(cfg.net_dims, cfg.state_dim, cfg.action_dim, gpu_id=cfg.gpu_id, args=cfg)
+    device = torch.device('cpu' if getattr(cfg, "gpu_id", -1) < 0 else 'cuda')
+    agent  = AgentDQN(cfg.net_dims, cfg.state_dim, cfg.action_dim, gpu_id=getattr(cfg, "gpu_id", -1), args=cfg)
     agent.device = device
 
     def _find_ckpt(root):
@@ -180,21 +271,34 @@ def load_dqn_actor(cfg, checkpoint_path: str | None = None):
 def rollout_dqn(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.csv", out_dir="./result"):
     """
     Run greedy actions using the loaded DQN actor on the given dataset.
-    - Flattens observation to 1D for DQN.
-    - Saves a CSV with step-level records to out_dir/csv_name.
-    - Copies the used checkpoint into out_dir for auditing.
+    - Uses _env_init_kw() to pass only valid kwargs into env
+    - Flattens obs to 1D
+    - Fallback-computes allocation_ratio/position_notional/equity/liquidity when missing
+    - Logs expected_gas (first step free; gas only when action changes) for quick sanity-check
     """
-    from utils.env import UniswapV3LiquidityEnv
+    # Env & module (to access decimals if present)
+    Env, env_mod, env_src = _get_env_class()
+    decimal_0 = getattr(env_mod, "decimal_0", None)
+    decimal_1 = getattr(env_mod, "decimal_1", None)
+
+    # Optional liquidity multiplier for fallback
+    try:
+        from utils.uniswap import liquidity_multiplier as _max_liq_mult
+    except Exception:
+        _max_liq_mult = None
 
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Compose environment kwargs
-    env_kwargs = dict(env_kwargs_base)
-    env_kwargs["numeric_data"] = data
-    env_kwargs["time_data"] = time_data
-    env_kwargs["max_steps"] = min(env_kwargs.get("max_steps", data.shape[0]-1), data.shape[0]-1)
-    env = UniswapV3LiquidityEnv(**env_kwargs)
+    # Compose environment kwargs (whitelist + remap)
+    base = dict(env_kwargs_base)
+    base.update({
+        "numeric_data": data,
+        "time_data": time_data,
+        "max_steps": min(base.get("max_steps", data.shape[0] - 1), data.shape[0] - 1),
+    })
+    env_kwargs = _env_init_kw(base)
+    env = Env(**env_kwargs)
 
     # Load actor
     agent, ckpt = load_dqn_actor(cfg)
@@ -205,17 +309,36 @@ def rollout_dqn(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.c
     except Exception:
         pass
 
-    # Reset (Gymnasium-compatible)
+    # Reset (old/new Gym compatible)
     s = env.reset()
     if isinstance(s, tuple):  # (obs, info)
         s = s[0]
-    s = np.asarray(s, dtype=np.float32)
-    if s.ndim > 1:
-        s = s.reshape(-1)
+    s = np.asarray(s, dtype=np.float32).reshape(-1)
 
-    records, done, total = [], False, 0.0
+    # Initial equity fallback
+    try:
+        eq_tracker = float(getattr(env, "equity")) if hasattr(env, "equity") else float(
+            env_kwargs.get("init_value", env_kwargs.get("total_liquidity", np.nan))
+        )
+    except Exception:
+        eq_tracker = np.nan
+
+    # Default action values
+    default_action_values = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+    try:
+        if hasattr(env, "action_values"):
+            av = np.asarray(getattr(env, "action_values"), dtype=np.float32)
+            if av.ndim == 1 and av.size >= 2:
+                default_action_values = av
+    except Exception:
+        pass
+
+    records, done, total, cum_max = [], False, 0.0, 0.0
+    last_action = None
+    printed_debug_once = False
+
     while not done:
-        st = torch.as_tensor(s, dtype=torch.float32, device=agent.device).view(1, -1)  # [1, state_dim]
+        st = torch.as_tensor(s, dtype=torch.float32, device=agent.device).view(1, -1)
         with torch.no_grad():
             q = agent.act(st)                # [1, action_dim]
             a = int(q.argmax(dim=1).item())  # greedy action
@@ -227,26 +350,79 @@ def rollout_dqn(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.c
         else:
             s_next, r, done, info = out
 
-        total += float(r)
+        rr = float(0.0 if (r is None or not np.isfinite(r)) else r)
+        total += rr
+        if total > cum_max:
+            cum_max = total
 
-        s_next = np.asarray(s_next, dtype=np.float32)
-        if s_next.ndim > 1:
-            s_next = s_next.reshape(-1)
+        s_next = np.asarray(s_next, dtype=np.float32).reshape(-1)
         s = s_next
 
         info = info or {}
+
+        # ---- Fallbacks ----
+        # allocation_ratio
+        alloc_ratio = info.get("allocation_ratio", None)
+        if alloc_ratio is None or not np.isfinite(alloc_ratio):
+            try:
+                alloc_ratio = float(default_action_values[a])
+            except Exception:
+                alloc_ratio = float("nan")
+
+        # equity
+        equity = info.get("equity", None)
+        if equity is None or not np.isfinite(equity):
+            try:
+                if hasattr(env, "equity"):
+                    equity = float(getattr(env, "equity"))
+                else:
+                    equity = float(eq_tracker)
+            except Exception:
+                equity = float("nan")
+
+        # position_notional
+        pos_notional = info.get("position_notional", None)
+        if pos_notional is None or not np.isfinite(pos_notional):
+            try:
+                if np.isfinite(equity) and np.isfinite(alloc_ratio):
+                    pos_notional = float(equity * alloc_ratio)
+                else:
+                    pos_notional = float("nan")
+            except Exception:
+                pos_notional = float("nan")
+
+        # liquidity fallback（需 decimal_0/1 + max_liquidity_multiplier）
+        liquidity = info.get("liquidity", None)
+        if (liquidity is None or not np.isfinite(liquidity)) and _max_liq_mult and (decimal_0 is not None) and (decimal_1 is not None):
+            try:
+                price_in = float(info.get("price_in", np.nan))
+                if np.isfinite(price_in) and np.isfinite(pos_notional):
+                    tick = int(round(math.log(price_in * (10 ** (decimal_0 - decimal_1)), 1.0001)))
+                    mult = float(_max_liq_mult(tick, 500))
+                    liquidity = float(mult * pos_notional * (10 ** decimal_1))
+                else:
+                    liquidity = float("nan")
+            except Exception:
+                liquidity = float("nan")
+
+        # ---- Record ----
         records.append({
             "t": info.get("t", len(records)),
             "time": info.get("time", np.nan),
             "action_idx": info.get("allocation_idx", a),
-            "allocation_ratio": info.get("allocation_ratio", np.nan),
+            "allocation_ratio": alloc_ratio,
+            "position_notional": pos_notional,
+            "liquidity": liquidity,
             "price_in": info.get("price_in", np.nan),
             "price_out": info.get("price_out", np.nan),
             "fee": info.get("fee", np.nan),
             "lvr": info.get("lvr", np.nan),
             "gas": info.get("gas_applied", np.nan),
-            "step_reward": float(r),
+            "step_reward": rr,
             "cum_reward": total,
+            "cum_reward_max": cum_max,
+            "equity": equity,
+            "terminated_reason": info.get("terminated_reason", None),
         })
 
     df = pd.DataFrame(records)
@@ -265,7 +441,7 @@ def best_dqn_rollout(
     TEST_ENV_KW: dict,
     *,
     result_root: str = "./result",
-    experiment_dir: str | Path | None = None,
+    experiment_dir: str | Path,   # ← REQUIRED
     action_dim: int = 5,
 ):
     """
@@ -277,12 +453,17 @@ def best_dqn_rollout(
 
     Returns a dict with file paths, metrics, and the cfg used for inference.
     """
-    from utils.env import UniswapV3LiquidityEnv  # needed for cfg construction
+    Env, _, _ = _get_env_class()
 
-    # Infer state_dim from windowed observations (flatten to 1D)
-    win = int(TRAIN_ENV_KW.get("window_size", 1))
-    feat = int(getattr(train_data, "shape", (0, 0))[1])
-    state_dim = win * feat if win > 1 else feat
+    # --- Probe true dims from the actual env (dynamic-filtered kwargs) ---
+    probe_kw = {
+        "numeric_data": train_data,
+        "time_data": train_time_data,
+        **TRAIN_ENV_KW,
+        "max_steps": min(int(TRAIN_ENV_KW.get("max_steps", train_data.shape[0]-1)), int(train_data.shape[0]-1)),
+    }
+    state_dim, action_dim_probe = _probe_env_dims(probe_kw)
+    action_dim_used = int(action_dim_probe if action_dim_probe and action_dim_probe > 0 else action_dim)
 
     # Locate experiment directory and pick the best trial
     exp_dir = _find_experiment_dir(experiment_dir)
@@ -294,9 +475,9 @@ def best_dqn_rollout(
     net_dims = tuple(params["net_dims"])
     cfg = _build_cfg_for_inference(
         best_trial_dir=best_trial_dir,
-        env_class=UniswapV3LiquidityEnv,
+        env_class=Env,
         state_dim=int(state_dim),
-        action_dim=int(action_dim),
+        action_dim=int(action_dim_used),
         net_dims=net_dims,
     )
 
@@ -311,8 +492,8 @@ def best_dqn_rollout(
         csv_name="train_result.csv", out_dir=str(out_dir)
     )
     df_test, test_return, test_csv_path = rollout_dqn(
-        test_data, test_time_data, TEST_ENV_KW, cfg
-        , csv_name="test_result.csv", out_dir=str(out_dir)
+        test_data, test_time_data, TEST_ENV_KW, cfg,
+        csv_name="test_result.csv", out_dir=str(out_dir)
     )
 
     # Summary
@@ -342,34 +523,34 @@ def best_dqn_rollout(
         "cfg": cfg,  # you can reuse this cfg and its checkpoint later
     }
 
+
 #####################################################################################################################################
 # PPO
 #####################################################################################################################################
 
 # ==== Best-trial loader + rollout for PPO (self-contained; saves to result/<trial_name>/) ====
-# Requirements in your session: numpy, pandas, torch, and your utils.env.UniswapV3LiquidityEnv.
 
 # --- Helper A) Locate experiment directory (Ray Tune results) ---
-def _find_experiment_dir_ppo(explicit: str | Path | None = None) -> Path:
+def _find_experiment_dir_ppo(explicit: str | Path | None) -> Path:
     """
-    Return the path to the Ray Tune PPO experiment directory containing trial folders.
-    Tries (1) explicit, (2) common local paths.
+    REQUIRE an explicit path chosen by the user.
+    Accepts either:
+      - the top-level experiment directory containing many trials, or
+      - a single trial directory, or
+      - a direct path to progress.csv / result.json (will use its parent dir).
     """
-    if explicit:
-        p = Path(explicit).expanduser().resolve()
-        if p.exists():
-            return p
-        raise FileNotFoundError(f"Experiment dir not found: {p}")
+    if explicit is None:
+        raise ValueError("Please pass experiment_dir=... (absolute or relative path). No fallback candidates are used.")
+    p = Path(explicit).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"PPO experiment path does not exist: {p}")
 
-    candidates = [
-        Path("./ray_results/ppo_univ3_search").resolve(),
-        Path("./experiments/ray_results/ppo_univ3_search").resolve(),
-        Path("/Users/seitahuang/Desktop/AMM_RL/experiments/ray_results/ppo_univ3_search").resolve(),  # adjust if needed
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError("PPO experiment directory not found. Set an explicit path or adjust candidates.")
+    if p.is_file():
+        if p.name in ("progress.csv", "result.json"):
+            return p.parent
+        raise FileNotFoundError(f"Expected a directory or a Ray log file (progress.csv/result.json), got file: {p}")
+
+    return p
 
 # --- Helper B) Pick the best trial directory by maximum cum_return_max ---
 def _pick_best_trial_ppo(exp_dir: Path) -> tuple[Path, float]:
@@ -465,6 +646,11 @@ def _build_cfg_for_inference_ppo(best_trial_dir: Path, env_class, state_dim: int
     cfg.cwd = str(cwd_dir)
     try:
         cfg.if_discrete = True
+    except Exception:
+        pass
+    cfg.env_num = 1
+    try:
+        cfg.max_step = int(1)
     except Exception:
         pass
     return cfg
@@ -565,43 +751,50 @@ def _to_discrete_idx_from_actor(actor, st, action_dim: int) -> int:
 def rollout_ppo(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.csv", out_dir="./result"):
     """
     Run greedy actions (argmax over logits) using the loaded PPO actor on the given dataset.
-    - Flattens observation to 1D if needed.
-    - Saves a CSV with step-level records to out_dir/csv_name.
-    - Copies the used checkpoint into out_dir for auditing.
+    - Uses _env_init_kw() to pass only valid kwargs into env
+    - Flattens obs to 1D if needed
+    - (Light) fallback for missing info fields
     """
-    from utils.env import UniswapV3LiquidityEnv
+    Env, env_mod, env_src = _get_env_class()
 
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Compose environment kwargs
-    env_kwargs = dict(env_kwargs_base)
-    env_kwargs["numeric_data"] = data
-    env_kwargs["time_data"] = time_data
-    env_kwargs["max_steps"] = min(env_kwargs.get("max_steps", data.shape[0]-1), data.shape[0]-1)
-    env = UniswapV3LiquidityEnv(**env_kwargs)
+    base = dict(env_kwargs_base)
+    base.update({
+        "numeric_data": data,
+        "time_data": time_data,
+        "max_steps": min(base.get("max_steps", data.shape[0]-1), data.shape[0]-1),
+    })
+    env_kwargs = _env_init_kw(base)
+    env = Env(**env_kwargs)
 
-    # Load actor
     agent, ckpt = load_ppo_actor(cfg)
-
-    # Copy checkpoint for reference
     try:
         shutil.copy2(ckpt, out_dir / os.path.basename(ckpt))
     except Exception:
         pass
 
-    # Reset (Gymnasium-compatible)
     s = env.reset()
-    if isinstance(s, tuple):  # (obs, info)
+    if isinstance(s, tuple):
         s = s[0]
-    s = np.asarray(s, dtype=np.float32)
-    if s.ndim > 1:
-        s = s.reshape(-1)
+    s = np.asarray(s, dtype=np.float32).reshape(-1)
+
+    # Default action values for fallback allocation ratio
+    default_action_values = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+    try:
+        if hasattr(env, "action_values"):
+            av = np.asarray(getattr(env, "action_values"), dtype=np.float32)
+            if av.ndim == 1 and av.size >= 2:
+                default_action_values = av
+    except Exception:
+        pass
 
     records, done, total, cum_max = [], False, 0.0, 0.0
     while not done:
         st = torch.as_tensor(s, dtype=torch.float32, device=getattr(agent, "device", torch.device("cpu"))).view(1, -1)
         idx = _to_discrete_idx_from_actor(agent.act, st, int(getattr(cfg, "action_dim", 5)))
+
         out = env.step(idx)
         if isinstance(out, tuple) and len(out) == 5:
             s_next, r, term, trunc, info = out
@@ -609,22 +802,31 @@ def rollout_ppo(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.c
         else:
             s_next, r, done, info = out
 
-        # sanitize
         rr = float(0.0 if (r is None or not np.isfinite(r)) else r)
         total += rr
-        if total > cum_max: cum_max = total
+        if total > cum_max:
+            cum_max = total
 
-        s_next = np.asarray(s_next, dtype=np.float32)
-        if s_next.ndim > 1:
-            s_next = s_next.reshape(-1)
+        s_next = np.asarray(s_next, dtype=np.float32).reshape(-1)
         s = s_next
 
         info = info or {}
+
+        # light fallback
+        alloc_ratio = info.get("allocation_ratio")
+        if alloc_ratio is None or not np.isfinite(alloc_ratio):
+            try:
+                alloc_ratio = float(default_action_values[idx])
+            except Exception:
+                alloc_ratio = float("nan")
+
         records.append({
             "t": info.get("t", len(records)),
             "time": info.get("time", np.nan),
             "action_idx": info.get("allocation_idx", idx),
-            "allocation_ratio": info.get("allocation_ratio", np.nan),
+            "allocation_ratio": alloc_ratio,
+            "position_notional": info.get("position_notional", np.nan),
+            "liquidity": info.get("liquidity", np.nan),
             "price_in": info.get("price_in", np.nan),
             "price_out": info.get("price_out", np.nan),
             "fee": info.get("fee", np.nan),
@@ -633,6 +835,8 @@ def rollout_ppo(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.c
             "step_reward": rr,
             "cum_reward": total,
             "cum_reward_max": cum_max,
+            "equity": info.get("equity", np.nan),
+            "terminated_reason": info.get("terminated_reason", None),
         })
 
     df = pd.DataFrame(records)
@@ -651,7 +855,7 @@ def best_ppo_rollout(
     TEST_ENV_KW: dict,
     *,
     result_root: str = "./result",
-    experiment_dir: str | Path | None = None,
+    experiment_dir: str | Path,   # ← REQUIRED
     action_dim: int = 5,
 ):
     """
@@ -663,12 +867,17 @@ def best_ppo_rollout(
 
     Returns a dict with file paths, metrics, and the cfg used for inference.
     """
-    from utils.env import UniswapV3LiquidityEnv  # needed for cfg construction
+    Env, _, _ = _get_env_class()
 
-    # Infer state_dim from windowed observations (flatten to 1D)
-    win = int(TRAIN_ENV_KW.get("window_size", 1))
-    feat = int(getattr(train_data, "shape", (0, 0))[1])
-    state_dim = win * feat if win > 1 else feat
+    # --- Probe true dims from the actual env (dynamic-filtered kwargs) ---
+    probe_kw = {
+        "numeric_data": train_data,
+        "time_data": train_time_data,
+        **TRAIN_ENV_KW,
+        "max_steps": min(int(TRAIN_ENV_KW.get("max_steps", train_data.shape[0]-1)), int(train_data.shape[0]-1)),
+    }
+    state_dim, action_dim_probe = _probe_env_dims(probe_kw)
+    action_dim_used = int(action_dim_probe if action_dim_probe and action_dim_probe > 0 else action_dim)
 
     # Locate experiment directory and pick the best trial
     exp_dir = _find_experiment_dir_ppo(experiment_dir)
@@ -680,9 +889,9 @@ def best_ppo_rollout(
     net_dims = tuple(params["net_dims"])
     cfg = _build_cfg_for_inference_ppo(
         best_trial_dir=best_trial_dir,
-        env_class=UniswapV3LiquidityEnv,
+        env_class=Env,
         state_dim=int(state_dim),
-        action_dim=int(action_dim),
+        action_dim=int(action_dim_used),
         net_dims=net_dims,
     )
 
