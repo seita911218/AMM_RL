@@ -12,7 +12,7 @@ from typing import Optional
 from utils.uniswap import swap_fee, LVR, liquidity_multiplier
 
 """
-Global State
+Gloabl State
 """
 
 path = os.path.dirname(os.path.abspath(__file__)) + '/..' + '/config' + '/config.json'
@@ -100,7 +100,6 @@ class UniswapV3LiquidityEnv(gym.Env):
         self._last_action_ratio: float = 0.0
         self.total_reward: float = 0.0
         self.equity: float = self.init_value       # current capital (internal state, not in observation)
-        self.prev_equity: float = self.init_value  # ← for info['prev_equity']
 
         # Old-gym seeding helper
         self.np_random, _ = seeding.np_random(None)
@@ -119,7 +118,6 @@ class UniswapV3LiquidityEnv(gym.Env):
         self._last_action_ratio = 0.0
         self.total_reward = 0.0
         self.equity = float(self.init_value)
-        self.prev_equity = float(self.init_value)  # ← keep in sync
         return self._get_obs()
 
     def step(self, action_idx: int):
@@ -147,7 +145,7 @@ class UniswapV3LiquidityEnv(gym.Env):
         x_scaled_vol = float(self.data[next_idx, 1]) if self.feature_dim >= 2 else 0.0
         y_scaled_vol = float(self.data[next_idx, 2]) if self.feature_dim >= 3 else 0.0
 
-        tick_in = int(round(math.log(price_in * 10**(decimal_1 - decimal_0), 1.0001)))
+        tick_in = int(round(math.log(price_in*10**(decimal_1-decimal_0), 1.0001)))
 
         # Allocation and notional position sized by current equity
         allocation_ratio = float(self.action_values[int(action_idx)])
@@ -167,9 +165,7 @@ class UniswapV3LiquidityEnv(gym.Env):
 
         # Update totals and equity
         self.total_reward += step_pnl
-        self.prev_equity = float(self.equity)             # ← snapshot before update
         self.equity = max(0.0, self.equity + step_pnl)
-        after_equity = float(self.equity)                 # ← for info
 
         # Advance time and save action
         self._t = next_idx
@@ -181,39 +177,20 @@ class UniswapV3LiquidityEnv(gym.Env):
         truncated = bool(self._t >= self.end_index)
         done = terminated or truncated
 
-        # Safe time extraction (works for 1D or 2D time_data)
-        try:
-            if hasattr(self.time_data, "__len__") and len(self.time_data) > t:
-                time_val = self.time_data[t][0] if np.ndim(self.time_data) == 2 else self.time_data[t]
-            else:
-                time_val = None
-        except Exception:
-            time_val = None
-
-        # Per-step return (relative pnl to previous equity)
-        step_ret = float(step_pnl / self.prev_equity) if self.prev_equity > 0 else 0.0
-
         obs = self._get_obs()
         info = {
             "t": self._t,
-            "time": time_val,
-            # ---- alignment with tune/eval ----
-            "prev_equity": float(self.prev_equity),
-            "after_equity": after_equity,        # primary key used by tune/eval
-            "equity": after_equity,              # kept for backward compatibility
-            "return": step_ret,                  # per-step return = pnl / prev_equity
-
+            "time": (self.time_data[t][0] if hasattr(self.time_data, "__getitem__") else None),
+            "equity": float(self.equity),                # reported via info (not part of obs)
             "allocation_idx": int(action_idx),
             "allocation_ratio": float(allocation_ratio),
             "position_notional": float(position_notional),
             "liquidity": float(liquidity),
-
             "price_in": float(price_in),
             "price_out": float(price_out),
             "fee": float(fee_component),
             "lvr": float(lvr_component),
             "gas_applied": float(gas_applied),
-
             "step_reward": float(step_pnl),
             "total_reward": float(self.total_reward),
             "terminated_reason": ("liquidation" if terminated else ("time_limit" if truncated else None)),

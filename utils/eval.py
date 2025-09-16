@@ -1,5 +1,5 @@
-# ==== Best-trial loader + single-run rollout (saves to result/<trial_name>/) ====
-# Requirements: numpy, pandas, torch, and your utils.env.UniswapV3LiquidityEnv.
+# ==== Best-trial loader + rollout (self-contained; saves to result/<trial_name>/) ====
+# Requirements: numpy, pandas, torch, and your utils.env[2].UniswapV3LiquidityEnv.
 
 import os, json, glob, shutil, sys, inspect, math
 from pathlib import Path
@@ -16,35 +16,34 @@ except Exception:
     pass
 
 
-# =========================
-# Env loader & kwargs filter
-# =========================
+# ===== Env loader & kwargs filtering =====
 
 def _get_env_class():
     """
-    Fixed import from utils.env (no env2 fallback).
-    Returns (EnvClass, env_module, module_name).
+    Prefer utils.env2.UniswapV3LiquidityEnv if available, else utils.env.UniswapV3LiquidityEnv.
+    Also returns the module object so we can access module-level constants (e.g., decimal_0/1).
     """
     from utils.env import UniswapV3LiquidityEnv as Env
     import utils.env as env_mod
     return Env, env_mod, "utils.env"
 
-
-# Whitelist (used only if signature inspection fails)
+# Static fallback list (used only if dynamic inspection fails)
 ENV_INIT_KEYS_FALLBACK = {
     "numeric_data", "time_data",
     "init_value", "liquidation_value",
-    "total_liquidity",
+    "total_liquidity",        # for older envs
     "gas_cost", "fee_tier",
-    "max_steps", "max_step",
+    "max_steps", "max_step",  # some envs use max_step
     "start_index",
 }
 
 def _env_init_kw(d: dict) -> dict:
     """
-    Keep only keys accepted by Env.__init__. Map a few legacy names if needed.
-    - init_value -> total_liquidity
-    - max_steps  -> max_step
+    Build kwargs for UniswapV3LiquidityEnv dynamically:
+    - Keep only keys present in the env __init__ signature.
+    - Map new->old names when needed:
+        init_value -> total_liquidity (if env expects total_liquidity)
+        max_steps  -> max_step        (if env expects max_step)
     """
     try:
         Env, _, _ = _get_env_class()
@@ -53,33 +52,34 @@ def _env_init_kw(d: dict) -> dict:
 
         out = {k: d[k] for k in d.keys() if k in params}
 
-        # Remap: init_value -> total_liquidity (older envs)
+        # Remap: init_value -> total_liquidity
         if "init_value" in d and "init_value" not in params and "total_liquidity" in params and "total_liquidity" not in out:
             out["total_liquidity"] = d["init_value"]
 
-        # Remap: max_steps -> max_step (older envs)
+        # Remap: max_steps -> max_step
         if "max_steps" in d and "max_steps" not in params and "max_step" in params and "max_step" not in out:
             out["max_step"] = d["max_steps"]
 
         return out
     except Exception:
-        # Fallback to static whitelist (best-effort)
+        # Fallback to static whitelist if inspection fails
         return {k: d[k] for k in d.keys() if k in ENV_INIT_KEYS_FALLBACK}
 
 def _probe_env_dims(env_kw: dict) -> tuple[int, int]:
-    """
-    Instantiate env once to get the true flattened obs_dim and action_dim.
-    """
+    """Instantiate env once to get true obs_dim (flattened) and action_dim."""
     Env, _, _ = _get_env_class()
     env = Env(**_env_init_kw(env_kw))
+
     s0 = env.reset()
     if isinstance(s0, tuple):  # (obs, info)
         s0 = s0[0]
     s0 = np.asarray(s0, dtype=np.float32)
     obs_dim = int(np.prod(s0.shape))
+
     act_dim = 5
     if hasattr(env, "action_space") and hasattr(env.action_space, "n"):
         act_dim = int(env.action_space.n)
+
     try:
         env.close()
     except Exception:
@@ -87,70 +87,53 @@ def _probe_env_dims(env_kw: dict) -> tuple[int, int]:
     return obs_dim, act_dim
 
 
-# =========================
-# Common helpers
-# =========================
+#####################################################################################################################################
+# DQN
+#####################################################################################################################################
 
+# --- Helper A) Locate experiment directory (Ray Tune results) ---
 def _find_experiment_dir(explicit: str | Path | None) -> Path:
     """
-    Require a Ray Tune experiment directory (or a file under it).
-    If a file is provided (progress.csv/result.json), use its parent directory.
+    REQUIRE an explicit path chosen by the user.
+    Accepts either:
+      - the top-level experiment directory containing many trials, or
+      - a single trial directory, or
+      - a direct path to progress.csv / result.json (will use its parent dir).
     """
     if explicit is None:
-        raise ValueError("Please pass experiment_dir=... (absolute or relative path).")
+        raise ValueError("Please pass experiment_dir=... (absolute or relative path). No fallback candidates are used.")
     p = Path(explicit).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Experiment path does not exist: {p}")
+
     if p.is_file():
         if p.name in ("progress.csv", "result.json"):
             return p.parent
         raise FileNotFoundError(f"Expected a directory or a Ray log file (progress.csv/result.json), got file: {p}")
+
     return p
 
-def _pick_best_trial_generic(exp_dir: Path) -> tuple[Path, float, str]:
+# --- Helper B) Pick the best trial directory by maximum cum_return_max ---
+def _pick_best_trial(exp_dir: Path) -> tuple[Path, float]:
     """
-    Scan all trials; prefer max(final_equity), fallback to max(cum_return_max).
-    Supports both progress.csv and result.json (JSONL).
-    Returns (best_trial_dir, best_score, best_metric_name).
+    Scan all trials under exp_dir. Prefer progress.csv; fallback to result.json (JSONL).
+    Return (best_trial_dir, best_score).
     """
-    best_dir, best_score, best_metric = None, -np.inf, "final_equity"
+    best_dir, best_score = None, -np.inf
 
-    # 1) result.json: final_equity
-    for js in exp_dir.rglob("result.json"):
-        try:
-            with open(js, "r") as f:
-                local_best = -np.inf
-                for line in f:
-                    rec = json.loads(line)
-                    v = rec.get("final_equity", None)
-                    if v is not None and np.isfinite(v) and v > local_best:
-                        local_best = float(v)
-                if local_best > best_score:
-                    best_score = local_best
-                    best_dir = js.parent
-                    best_metric = "final_equity"
-        except Exception:
-            pass
-
-    # 2) progress.csv: final_equity → cum_return_max
+    # Prefer progress.csv aggregated metrics
     for csv_path in exp_dir.rglob("progress.csv"):
         try:
             df = pd.read_csv(csv_path)
-            cand, metric_name = None, None
-            if "final_equity" in df.columns:
-                cand = pd.to_numeric(df["final_equity"], errors="coerce").max()
-                metric_name = "final_equity"
-            elif "cum_return_max" in df.columns:
-                cand = pd.to_numeric(df["cum_return_max"], errors="coerce").max()
-                metric_name = "cum_return_max"
-            if cand is not None and pd.notna(cand) and float(cand) > best_score:
-                best_score = float(cand)
-                best_dir = csv_path.parent
-                best_metric = metric_name
+            if "cum_return_max" in df.columns:
+                v = pd.to_numeric(df["cum_return_max"], errors="coerce").max()
+                if pd.notna(v) and float(v) > best_score:
+                    best_score = float(v)
+                    best_dir = csv_path.parent
         except Exception:
             pass
 
-    # 3) fallback result.json: cum_return_max
+    # Fallback: scan result.json lines (newline-delimited JSON)
     if best_dir is None:
         for js in exp_dir.rglob("result.json"):
             try:
@@ -164,97 +147,76 @@ def _pick_best_trial_generic(exp_dir: Path) -> tuple[Path, float, str]:
                     if local_best > best_score:
                         best_score = local_best
                         best_dir = js.parent
-                        best_metric = "cum_return_max"
             except Exception:
                 pass
 
     if best_dir is None:
-        raise RuntimeError("No `final_equity` (or `cum_return_max`) found in any trial logs.")
-    return best_dir, best_score, best_metric
+        raise RuntimeError("No `cum_return_max` found in any trial logs.")
+    return best_dir, best_score
 
+# --- Helper C) Read trial hyperparameters (e.g., net_dims) from params.json ---
 def _read_trial_params(trial_dir: Path) -> dict:
     """
-    Read hyperparameters (currently net_dims) in a robust way.
-    Supports filenames: params.json / configuration.json / param.json.
-    Returns {"net_dims": (h1, h2, ...)} with sensible defaults if missing.
+    Read parameters like `net_dims` from params.json/configuration.json/param.json.
     """
-    def _coerce_net_dims(val):
-        if val is None:
-            return (64, 64)
-        if isinstance(val, (list, tuple)):
-            try:
-                return tuple(int(x) for x in val) if len(val) > 0 else (64, 64)
-            except Exception:
-                return (64, 64)
-        if isinstance(val, (int, float)):
-            i = int(val)
-            return (i, i)
-        # Sometimes stored as a string like "[128, 128]"
-        try:
-            parsed = json.loads(val)
-            if isinstance(parsed, (list, tuple)):
-                return tuple(int(x) for x in parsed)
-        except Exception:
-            pass
-        return (64, 64)
-
+    params = {}
     for name in ("params.json", "configuration.json", "param.json"):
         p = trial_dir / name
         if p.exists():
             try:
                 with open(p, "r") as f:
                     params = json.load(f)
-                net_dims = params.get("net_dims", None)
-                if net_dims is None and isinstance(params.get("params"), dict):
-                    net_dims = params["params"].get("net_dims", None)
-                if net_dims is None and isinstance(params.get("config"), dict):
-                    net_dims = params["config"].get("net_dims", None)
-                return {"net_dims": _coerce_net_dims(net_dims)}
             except Exception:
                 pass
+            break
 
-    # Default fallback
-    return {"net_dims": (64, 64)}
+    net_dims = params.get("net_dims", (64, 64))
+    if isinstance(net_dims, list):
+        net_dims = tuple(int(x) for x in net_dims)
+    elif isinstance(net_dims, (int, float)):
+        net_dims = (int(net_dims), int(net_dims))
+    return {"net_dims": net_dims}
 
-
-# =========================
-# DQN inference
-# =========================
-
-def _build_cfg_for_inference_dqn(best_trial_dir: Path, env_class, state_dim: int, action_dim: int, net_dims: tuple):
+# --- Helper D) Build ElegantRL Config for inference ---
+def _build_cfg_for_inference(best_trial_dir: Path, env_class, state_dim: int, action_dim: int, net_dims: tuple):
     """
-    Build a minimal ElegantRL Config for DQN inference and point cwd to <trial_dir>/erl if it exists.
+    Build a minimal ElegantRL Config for inference.
+    Points cfg.cwd to <trial_dir>/erl if it exists, otherwise the trial dir.
     """
     from elegantrl.train.config import Config
-    from elegantrl.agents.AgentDQN import AgentDQN  # noqa: F401 (ensure presence)
+    from elegantrl.agents.AgentDQN import AgentDQN
 
     erl_dir = best_trial_dir / "erl"
     cwd_dir = erl_dir if erl_dir.exists() else best_trial_dir
 
-    cfg = Config(agent_class=None, env_class=env_class, env_args=None)
+    cfg = Config(agent_class=AgentDQN, env_class=env_class, env_args=None)
     cfg.state_dim = int(state_dim)
     cfg.action_dim = int(action_dim)
     cfg.net_dims = tuple(net_dims)
     cfg.gpu_id = 0 if torch.cuda.is_available() else -1
     cfg.cwd = str(cwd_dir)
+
+    # Helpful extras for compatibility
     try:
         cfg.if_discrete = True
     except Exception:
         pass
     cfg.env_num = 1
     try:
+        # max_step is not strictly required for inference, but set for completeness
         cfg.max_step = int(1)
     except Exception:
         pass
     return cfg
 
+# --- Helper E) Robust DQN actor loader (prefers actor_latest.pth) ---
 def load_dqn_actor(cfg, checkpoint_path: str | None = None):
     """
     Load DQN actor from checkpoint. Accepts:
       - raw state_dict
       - dict with "state_dict"
-      - nn.Module (actor), or dict with "act"/"actor".
-    Prefers actor_latest.pth, then actor.pth/pt, then actor__*.pt (search recursively under cfg.cwd).
+      - nn.Module (actor), or dict with "act"/"actor" module.
+    Searches cfg.cwd recursively, preferring actor_latest.pth, then actor.pth/pt, then actor__*.pt.
     """
     from elegantrl.agents.AgentDQN import AgentDQN
     device = torch.device('cpu' if getattr(cfg, "gpu_id", -1) < 0 else 'cuda')
@@ -265,8 +227,10 @@ def load_dqn_actor(cfg, checkpoint_path: str | None = None):
         for name in ("actor_latest.pth", "actor.pth", "actor.pt"):
             p = os.path.join(root, name)
             if os.path.isfile(p): return p
+        # try snapshots
         cands = sorted(glob.glob(os.path.join(root, "actor__*.pt")))
         if cands: return cands[-1]
+        # recurse into subdirs
         for d in sorted(glob.glob(os.path.join(root, "*"))):
             if os.path.isdir(d):
                 p = _find_ckpt(d)
@@ -296,58 +260,70 @@ def load_dqn_actor(cfg, checkpoint_path: str | None = None):
         elif "actor" in obj and isinstance(obj["actor"], nn.Module):
             _load_module(obj["actor"])
         else:
+            # assume it's a raw state_dict
             agent.act.load_state_dict(obj); agent.act.eval()
     else:
         raise TypeError(f"Unsupported checkpoint type: {type(obj)}")
 
     return agent, ckpt
 
-def rollout_dqn(
-    data: np.ndarray,
-    time_data: np.ndarray,
-    env_kwargs_base: dict,
-    cfg,
-    csv_name: str = "dqn_result.csv",
-    out_dir: str = "./result",
-):
+# --- Helper F) Greedy rollout with logging to CSV (saves into out_dir) ---
+def rollout_dqn(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.csv", out_dir="./result"):
     """
-    Run greedy actions using the loaded DQN actor on a single dataset.
-    Records fields aligned with env.info: after_equity, prev_equity, return, gas_applied, etc.
+    Run greedy actions using the loaded DQN actor on the given dataset.
+    - Uses _env_init_kw() to pass only valid kwargs into env
+    - Flattens obs to 1D
+    - Fallback-computes allocation_ratio/position_notional/equity/liquidity when missing
+    - Logs expected_gas (first step free; gas only when action changes) for quick sanity-check
     """
-    # Optional fallback liquidity calc (not required)
-    try:
-        from utils.uniswap import liquidity_multiplier as _liq_mult
-    except Exception:
-        _liq_mult = None
-
-    Env, env_mod, _ = _get_env_class()
+    # Env & module (to access decimals if present)
+    Env, env_mod, env_src = _get_env_class()
     decimal_0 = getattr(env_mod, "decimal_0", None)
     decimal_1 = getattr(env_mod, "decimal_1", None)
+
+    # Optional liquidity multiplier for fallback
+    try:
+        from utils.uniswap import liquidity_multiplier as _max_liq_mult
+    except Exception:
+        _max_liq_mult = None
 
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Compose environment kwargs (whitelist + remap)
     base = dict(env_kwargs_base)
     base.update({
         "numeric_data": data,
         "time_data": time_data,
-        "max_steps": min(base.get("max_steps", data.shape[0]-1), data.shape[0]-1),
+        "max_steps": min(base.get("max_steps", data.shape[0] - 1), data.shape[0] - 1),
     })
     env_kwargs = _env_init_kw(base)
     env = Env(**env_kwargs)
 
+    # Load actor
     agent, ckpt = load_dqn_actor(cfg)
+
+    # Copy checkpoint for reference
     try:
         shutil.copy2(ckpt, out_dir / os.path.basename(ckpt))
     except Exception:
         pass
 
+    # Reset (old/new Gym compatible)
     s = env.reset()
-    if isinstance(s, tuple):
+    if isinstance(s, tuple):  # (obs, info)
         s = s[0]
     s = np.asarray(s, dtype=np.float32).reshape(-1)
 
-    # Default action values (fallback for allocation_ratio)
+    # Initial equity fallback
+    try:
+        eq_tracker = float(getattr(env, "equity")) if hasattr(env, "equity") else float(
+            env_kwargs.get("init_value", env_kwargs.get("total_liquidity", np.nan))
+        )
+    except Exception:
+        eq_tracker = np.nan
+
+    # Default action values
     default_action_values = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
     try:
         if hasattr(env, "action_values"):
@@ -364,8 +340,8 @@ def rollout_dqn(
     while not done:
         st = torch.as_tensor(s, dtype=torch.float32, device=agent.device).view(1, -1)
         with torch.no_grad():
-            q = agent.act(st)
-            a = int(q.argmax(dim=1).item())
+            q = agent.act(st)                # [1, action_dim]
+            a = int(q.argmax(dim=1).item())  # greedy action
 
         out = env.step(a)
         if isinstance(out, tuple) and len(out) == 5:
@@ -376,58 +352,60 @@ def rollout_dqn(
 
         rr = float(0.0 if (r is None or not np.isfinite(r)) else r)
         total += rr
-        cum_max = max(cum_max, total)
+        if total > cum_max:
+            cum_max = total
 
-        s = np.asarray(s_next, dtype=np.float32).reshape(-1)
+        s_next = np.asarray(s_next, dtype=np.float32).reshape(-1)
+        s = s_next
+
         info = info or {}
 
+        # ---- Fallbacks ----
         # allocation_ratio
-        alloc_ratio = info.get("allocation_ratio")
+        alloc_ratio = info.get("allocation_ratio", None)
         if alloc_ratio is None or not np.isfinite(alloc_ratio):
             try:
                 alloc_ratio = float(default_action_values[a])
             except Exception:
                 alloc_ratio = float("nan")
 
-        # equity fields
-        after_equity = info.get("after_equity", np.nan)
-        prev_equity  = info.get("prev_equity", np.nan)
+        # equity
+        equity = info.get("equity", None)
+        if equity is None or not np.isfinite(equity):
+            try:
+                if hasattr(env, "equity"):
+                    equity = float(getattr(env, "equity"))
+                else:
+                    equity = float(eq_tracker)
+            except Exception:
+                equity = float("nan")
 
-        # position_notional fallback
-        pos_notional = info.get("position_notional")
+        # position_notional
+        pos_notional = info.get("position_notional", None)
         if pos_notional is None or not np.isfinite(pos_notional):
-            if np.isfinite(after_equity) and np.isfinite(alloc_ratio):
-                pos_notional = float(after_equity * alloc_ratio)
-            else:
+            try:
+                if np.isfinite(equity) and np.isfinite(alloc_ratio):
+                    pos_notional = float(equity * alloc_ratio)
+                else:
+                    pos_notional = float("nan")
+            except Exception:
                 pos_notional = float("nan")
 
-        # optional liquidity fallback
+        # liquidity fallback（需 decimal_0/1 + max_liquidity_multiplier）
         liquidity = info.get("liquidity", None)
-        if (liquidity is None or not np.isfinite(liquidity)) and _liq_mult and (decimal_0 is not None) and (decimal_1 is not None):
+        if (liquidity is None or not np.isfinite(liquidity)) and _max_liq_mult and (decimal_0 is not None) and (decimal_1 is not None):
             try:
                 price_in = float(info.get("price_in", np.nan))
                 if np.isfinite(price_in) and np.isfinite(pos_notional):
-                    tick = int(round(math.log(price_in * (10 ** (decimal_1 - decimal_0)), 1.0001)))
-                    mult = float(_liq_mult(tick, 500))
+                    tick = int(round(math.log(price_in * (10 ** (decimal_0 - decimal_1)), 1.0001)))
+                    mult = float(_max_liq_mult(tick, 500))
                     liquidity = float(mult * pos_notional * (10 ** decimal_1))
                 else:
                     liquidity = float("nan")
             except Exception:
                 liquidity = float("nan")
 
-        # expected gas (first step free; only when action changes)
-        expected_gas = 0.0 if (last_action is None or a == last_action) else float(getattr(env, "gas_cost", 0.0))
-        last_action = a
-
-        debug_note = None
-        if not printed_debug_once:
-            printed_debug_once = True
-            try:
-                EnvSig = str(inspect.signature(_get_env_class()[0].__init__))
-            except Exception:
-                EnvSig = "n/a"
-            debug_note = f"env_sig={EnvSig}; keys_in_info={list(info.keys())}"
-
+        # ---- Record ----
         records.append({
             "t": info.get("t", len(records)),
             "time": info.get("time", np.nan),
@@ -439,102 +417,228 @@ def rollout_dqn(
             "price_out": info.get("price_out", np.nan),
             "fee": info.get("fee", np.nan),
             "lvr": info.get("lvr", np.nan),
-            "gas_applied": info.get("gas_applied", np.nan),
-            "expected_gas": expected_gas,
+            "gas": info.get("gas_applied", np.nan),
             "step_reward": rr,
             "cum_reward": total,
             "cum_reward_max": cum_max,
-            "prev_equity": prev_equity,
-            "after_equity": after_equity,
-            "return": info.get("return", np.nan),
-            "total_reward_env": info.get("total_reward", np.nan),
+            "equity": equity,
             "terminated_reason": info.get("terminated_reason", None),
-            "debug_note": debug_note,
         })
 
     df = pd.DataFrame(records)
-    out_path = Path(out_dir) / csv_name
+    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
-    print(f"✅ DQN Rollout saved: {out_path}\nTotal return (sum rewards): {total:.6f}\nCheckpoint: {ckpt}")
+    print(f"✅ Rollout saved: {out_path}\nTotal return: {total:.6f}\nCheckpoint: {ckpt}")
     return df, total, str(out_path)
 
+# --- Main: one-call pipeline (find best trial → build cfg → run train/test rollouts) ---
 def best_dqn_rollout(
-    data: np.ndarray,
-    time_data: np.ndarray,
-    ENV_KW: dict,
+    train_data,
+    train_time_data,
+    test_data,
+    test_time_data,
+    TRAIN_ENV_KW: dict,
+    TEST_ENV_KW: dict,
     *,
     result_root: str = "./result",
-    experiment_dir: str | Path,   # REQUIRED
+    experiment_dir: str | Path,   # ← REQUIRED
     action_dim: int = 5,
-    csv_name: str = "dqn_result.csv",
 ):
     """
-    Find best DQN trial (final_equity → cum_return_max), build cfg, run ONE rollout, save CSV.
+    One-call pipeline:
+      1) Locate the best Ray Tune trial by `cum_return_max`
+      2) Build an ElegantRL Config for inference
+      3) Run greedy rollouts on train & test sets
+      4) Save CSVs and a copy of the used checkpoint to result/<trial_name>/
+
+    Returns a dict with file paths, metrics, and the cfg used for inference.
     """
     Env, _, _ = _get_env_class()
 
-    # Probe real dims
-    probe_kw = {"numeric_data": data, "time_data": time_data, **ENV_KW,
-                "max_steps": min(int(ENV_KW.get("max_steps", data.shape[0]-1)), int(data.shape[0]-1))}
+    # --- Probe true dims from the actual env (dynamic-filtered kwargs) ---
+    probe_kw = {
+        "numeric_data": train_data,
+        "time_data": train_time_data,
+        **TRAIN_ENV_KW,
+        "max_steps": min(int(TRAIN_ENV_KW.get("max_steps", train_data.shape[0]-1)), int(train_data.shape[0]-1)),
+    }
     state_dim, action_dim_probe = _probe_env_dims(probe_kw)
     action_dim_used = int(action_dim_probe if action_dim_probe and action_dim_probe > 0 else action_dim)
 
-    # Pick best trial
+    # Locate experiment directory and pick the best trial
     exp_dir = _find_experiment_dir(experiment_dir)
-    best_trial_dir, best_score, best_metric = _pick_best_trial_generic(exp_dir)
+    best_trial_dir, best_score = _pick_best_trial(exp_dir)
     trial_tag = best_trial_dir.name
 
-    # Read params & build cfg
+    # Read params (net_dims) and build cfg for inference
     params = _read_trial_params(best_trial_dir)
     net_dims = tuple(params["net_dims"])
-    cfg = _build_cfg_for_inference_dqn(best_trial_dir, Env, int(state_dim), int(action_dim_used), net_dims)
+    cfg = _build_cfg_for_inference(
+        best_trial_dir=best_trial_dir,
+        env_class=Env,
+        state_dim=int(state_dim),
+        action_dim=int(action_dim_used),
+        net_dims=net_dims,
+    )
 
-    # Output dir
-    out_dir = Path(result_root).resolve() / trial_tag
+    # Prepare output directory: result/<trial_name>/
+    result_root_path = Path(result_root).resolve()
+    out_dir = result_root_path / trial_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Rollout once
-    df, total_return, csv_path = rollout_dqn(data, time_data, ENV_KW, cfg, csv_name=csv_name, out_dir=str(out_dir))
+    # Run rollouts (train / test) and write CSVs into the result folder
+    df_train, train_return, train_csv_path = rollout_dqn(
+        train_data, train_time_data, TRAIN_ENV_KW, cfg,
+        csv_name="train_result.csv", out_dir=str(out_dir)
+    )
+    df_test, test_return, test_csv_path = rollout_dqn(
+        test_data, test_time_data, TEST_ENV_KW, cfg,
+        csv_name="test_result.csv", out_dir=str(out_dir)
+    )
 
     # Summary
-    print("🏆 DQN Best trial:", best_trial_dir)
-    print(f"   best {best_metric}:", best_score)
-    print("   net_dims:", net_dims)
+    print("🏆 Best trial:", best_trial_dir)
+    print("   best cum_return_max:", best_score)
+    print("   net_dims from params:", net_dims)
     print("📂 Output dir:", out_dir)
-    print(f"📈 Total return (sum rewards): {total_return:.6f}")
-    print(f"📝 File:", csv_path)
+    print(f"📈 Train return: {train_return:.6f} | Test return: {test_return:.6f}")
+    print(f"📝 Files: {train_csv_path} , {test_csv_path}")
 
     return {
         "trial_dir": str(best_trial_dir),
         "trial_tag": trial_tag,
-        "best_metric": best_metric,
-        "best_metric_value": float(best_score),
+        "best_cum_return_max": float(best_score),
         "net_dims": net_dims,
         "out_dir": str(out_dir),
-        "result": {"csv": str(csv_path), "total_return": float(total_return), "dataframe": df},
-        "cfg": cfg,
+        "train": {
+            "csv": str(train_csv_path),
+            "total_return": float(train_return),
+            "dataframe": df_train,
+        },
+        "test": {
+            "csv": str(test_csv_path),
+            "total_return": float(test_return),
+            "dataframe": df_test,
+        },
+        "cfg": cfg,  # you can reuse this cfg and its checkpoint later
     }
 
 
-# =========================
-# PPO inference
-# =========================
+#####################################################################################################################################
+# PPO
+#####################################################################################################################################
 
+# ==== Best-trial loader + rollout for PPO (self-contained; saves to result/<trial_name>/) ====
+
+# --- Helper A) Locate experiment directory (Ray Tune results) ---
+def _find_experiment_dir_ppo(explicit: str | Path | None) -> Path:
+    """
+    REQUIRE an explicit path chosen by the user.
+    Accepts either:
+      - the top-level experiment directory containing many trials, or
+      - a single trial directory, or
+      - a direct path to progress.csv / result.json (will use its parent dir).
+    """
+    if explicit is None:
+        raise ValueError("Please pass experiment_dir=... (absolute or relative path). No fallback candidates are used.")
+    p = Path(explicit).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"PPO experiment path does not exist: {p}")
+
+    if p.is_file():
+        if p.name in ("progress.csv", "result.json"):
+            return p.parent
+        raise FileNotFoundError(f"Expected a directory or a Ray log file (progress.csv/result.json), got file: {p}")
+
+    return p
+
+# --- Helper B) Pick the best trial directory by maximum cum_return_max ---
+def _pick_best_trial_ppo(exp_dir: Path) -> tuple[Path, float]:
+    """
+    Scan all trials under exp_dir. Prefer progress.csv; fallback to result.json (JSONL).
+    Return (best_trial_dir, best_score).
+    """
+    best_dir, best_score = None, -np.inf
+
+    # Prefer progress.csv aggregated metrics
+    for csv_path in exp_dir.rglob("progress.csv"):
+        try:
+            df = pd.read_csv(csv_path)
+            if "cum_return_max" in df.columns:
+                v = pd.to_numeric(df["cum_return_max"], errors="coerce").max()
+                if pd.notna(v) and float(v) > best_score:
+                    best_score = float(v)
+                    best_dir = csv_path.parent
+        except Exception:
+            pass
+
+    # Fallback: scan result.json lines
+    if best_dir is None:
+        for js in exp_dir.rglob("result.json"):
+            try:
+                with open(js, "r") as f:
+                    local_best = -np.inf
+                    for line in f:
+                        rec = json.loads(line)
+                        v = rec.get("cum_return_max", None)
+                        if v is not None and np.isfinite(v) and v > local_best:
+                            local_best = float(v)
+                    if local_best > best_score:
+                        best_score = local_best
+                        best_dir = js.parent
+            except Exception:
+                pass
+
+    if best_dir is None:
+        raise RuntimeError("No `cum_return_max` found in any PPO trial logs.")
+    return best_dir, best_score
+
+# --- Helper C) Read trial hyperparameters (e.g., net_dims) from params.json ---
+def _read_trial_params_ppo(trial_dir: Path) -> dict:
+    """
+    Read parameters like `net_dims` from params.json/configuration.json/param.json.
+    """
+    params = {}
+    for name in ("params.json", "configuration.json", "param.json"):
+        p = trial_dir / name
+        if p.exists():
+            try:
+                with open(p, "r") as f:
+                    params = json.load(f)
+            except Exception:
+                pass
+            break
+
+    net_dims = params.get("net_dims", (64, 64))
+    if isinstance(net_dims, list):
+        net_dims = tuple(int(x) for x in net_dims)
+    elif isinstance(net_dims, (int, float)):
+        net_dims = (int(net_dims), int(net_dims))
+    return {"net_dims": net_dims}
+
+# --- Helper D) Build ElegantRL Config for inference (PPO, discrete) ---
 def _build_cfg_for_inference_ppo(best_trial_dir: Path, env_class, state_dim: int, action_dim: int, net_dims: tuple):
     """
-    Build a minimal ElegantRL Config for PPO inference (discrete).
+    Build a minimal ElegantRL Config for PPO inference.
+    Prefers AgentDiscretePPO; falls back to AgentPPO with discrete nets.
+    Points cfg.cwd to <trial_dir>/erl_ppo (or erl) if exists, otherwise the trial dir.
     """
     from elegantrl.train.config import Config
     try:
-        from elegantrl.agents.AgentPPO import AgentDiscretePPO as PPOAgent  # noqa
+        from elegantrl.agents.AgentPPO import AgentDiscretePPO as PPOAgent
     except Exception:
-        from elegantrl.agents.AgentPPO import AgentPPO as PPOAgent          # noqa
+        from elegantrl.agents.AgentPPO import AgentPPO as PPOAgent
 
     erl_ppo_dir = best_trial_dir / "erl_ppo"
     erl_dir     = best_trial_dir / "erl"
-    cwd_dir = erl_ppo_dir if erl_ppo_dir.exists() else (erl_dir if erl_dir.exists() else best_trial_dir)
+    if erl_ppo_dir.exists():
+        cwd_dir = erl_ppo_dir
+    elif erl_dir.exists():
+        cwd_dir = erl_dir
+    else:
+        cwd_dir = best_trial_dir
 
-    cfg = Config(agent_class=None, env_class=env_class, env_args=None)
+    cfg = Config(agent_class=PPOAgent, env_class=env_class, env_args=None)
     cfg.state_dim = int(state_dim)
     cfg.action_dim = int(action_dim)
     cfg.net_dims = tuple(net_dims)
@@ -551,10 +655,14 @@ def _build_cfg_for_inference_ppo(best_trial_dir: Path, env_class, state_dim: int
         pass
     return cfg
 
+# --- Helper E) Robust PPO actor loader (prefers actor_latest/actor_best) ---
 def load_ppo_actor(cfg, checkpoint_path: str | None = None):
     """
-    Robust PPO actor loader (prefers actor_latest/actor_best).
-    Accepts state_dict, dict with state_dict, or nn.Module.
+    Load PPO actor from checkpoint. Accepts:
+      - raw state_dict
+      - dict with "state_dict"
+      - nn.Module (actor), or dict with "act"/"actor" module.
+    Searches cfg.cwd recursively, preferring actor_latest.pth, actor_best.pth, then actor.pth/pt, then actor__*.pt.
     """
     try:
         from elegantrl.agents.AgentPPO import AgentDiscretePPO as PPOAgent
@@ -569,8 +677,10 @@ def load_ppo_actor(cfg, checkpoint_path: str | None = None):
         for name in ("actor_latest.pth", "actor_best.pth", "actor.pth", "actor.pt"):
             p = os.path.join(root, name)
             if os.path.isfile(p): return p
+        # try snapshots
         cands = sorted(glob.glob(os.path.join(root, "actor__*.pt")))
         if cands: return cands[-1]
+        # recurse into subdirs
         for d in sorted(glob.glob(os.path.join(root, "*"))):
             if os.path.isdir(d):
                 p = _find_ckpt(d)
@@ -600,16 +710,17 @@ def load_ppo_actor(cfg, checkpoint_path: str | None = None):
         elif "actor" in obj and isinstance(obj["actor"], nn.Module):
             _load_module(obj["actor"])
         else:
+            # assume it's a raw state_dict
             agent.act.load_state_dict(obj); agent.act.eval()
     else:
         raise TypeError(f"Unsupported checkpoint type: {type(obj)}")
 
     return agent, ckpt
 
+# --- Helper F) Convert PPO actor outputs to a discrete index (0..action_dim-1) ---
 def _to_discrete_idx_from_actor(actor, st, action_dim: int) -> int:
     """
-    Turn actor output into a valid discrete action index [0..action_dim-1].
-    Supports logits tensor or Agent actor outputs.
+    Robustly turn any actor output (logits/tensor/tuple) into a valid discrete action index.
     """
     with torch.no_grad():
         a = None
@@ -631,24 +742,20 @@ def _to_discrete_idx_from_actor(actor, st, action_dim: int) -> int:
             except Exception:
                 idx = int(a)
         else:
-            idx = int(np.argmax(a))
+            idx = int(np.argmax(a))  # logits / vector → argmax
         if idx < 0: idx = 0
         if idx >= action_dim: idx = action_dim - 1
         return idx
 
-def rollout_ppo(
-    data: np.ndarray,
-    time_data: np.ndarray,
-    env_kwargs_base: dict,
-    cfg,
-    csv_name: str = "ppo_result.csv",
-    out_dir: str = "./result",
-):
+# --- Helper G) Greedy rollout with logging to CSV (saves into out_dir) ---
+def rollout_ppo(data, time_data, env_kwargs_base: dict, cfg, csv_name="rollout.csv", out_dir="./result"):
     """
-    Run greedy actions (argmax over logits) using the loaded PPO actor on a single dataset.
-    Records fields aligned with env.info.
+    Run greedy actions (argmax over logits) using the loaded PPO actor on the given dataset.
+    - Uses _env_init_kw() to pass only valid kwargs into env
+    - Flattens obs to 1D if needed
+    - (Light) fallback for missing info fields
     """
-    Env, _, _ = _get_env_class()
+    Env, env_mod, env_src = _get_env_class()
 
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -673,7 +780,7 @@ def rollout_ppo(
         s = s[0]
     s = np.asarray(s, dtype=np.float32).reshape(-1)
 
-    # Default action values (fallback for allocation_ratio)
+    # Default action values for fallback allocation ratio
     default_action_values = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
     try:
         if hasattr(env, "action_values"):
@@ -697,12 +804,15 @@ def rollout_ppo(
 
         rr = float(0.0 if (r is None or not np.isfinite(r)) else r)
         total += rr
-        cum_max = max(cum_max, total)
+        if total > cum_max:
+            cum_max = total
 
-        s = np.asarray(s_next, dtype=np.float32).reshape(-1)
+        s_next = np.asarray(s_next, dtype=np.float32).reshape(-1)
+        s = s_next
+
         info = info or {}
 
-        # allocation_ratio fallback
+        # light fallback
         alloc_ratio = info.get("allocation_ratio")
         if alloc_ratio is None or not np.isfinite(alloc_ratio):
             try:
@@ -721,70 +831,108 @@ def rollout_ppo(
             "price_out": info.get("price_out", np.nan),
             "fee": info.get("fee", np.nan),
             "lvr": info.get("lvr", np.nan),
-            "gas_applied": info.get("gas_applied", np.nan),
+            "gas": info.get("gas_applied", np.nan),
             "step_reward": rr,
             "cum_reward": total,
             "cum_reward_max": cum_max,
-            "prev_equity": info.get("prev_equity", np.nan),
-            "after_equity": info.get("after_equity", np.nan),
-            "return": info.get("return", np.nan),
-            "total_reward_env": info.get("total_reward", np.nan),
+            "equity": info.get("equity", np.nan),
             "terminated_reason": info.get("terminated_reason", None),
         })
 
     df = pd.DataFrame(records)
-    out_path = Path(out_dir) / csv_name
+    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
-    print(f"✅ PPO Rollout saved: {out_path}\nTotal return (sum rewards): {total:.6f}\nCheckpoint: {ckpt}")
+    print(f"✅ PPO Rollout saved: {out_path}\nTotal return: {total:.6f}\nCheckpoint: {ckpt}")
     return df, total, str(out_path)
 
+# --- Main: one-call pipeline (find best trial → build cfg → run train/test rollouts) ---
 def best_ppo_rollout(
-    data: np.ndarray,
-    time_data: np.ndarray,
-    ENV_KW: dict,
+    train_data,
+    train_time_data,
+    test_data,
+    test_time_data,
+    TRAIN_ENV_KW: dict,
+    TEST_ENV_KW: dict,
     *,
     result_root: str = "./result",
-    experiment_dir: str | Path,   # REQUIRED
+    experiment_dir: str | Path,   # ← REQUIRED
     action_dim: int = 5,
-    csv_name: str = "ppo_result.csv",
 ):
     """
-    Find best PPO trial (final_equity → cum_return_max), build cfg, run ONE rollout, save CSV.
+    One-call pipeline for PPO:
+      1) Locate the best Ray Tune trial by `cum_return_max`
+      2) Build an ElegantRL Config for inference (discrete actor)
+      3) Run greedy rollouts on train & test sets
+      4) Save CSVs and a copy of the used checkpoint to result/<trial_name>/
+
+    Returns a dict with file paths, metrics, and the cfg used for inference.
     """
     Env, _, _ = _get_env_class()
 
-    probe_kw = {"numeric_data": data, "time_data": time_data, **ENV_KW,
-                "max_steps": min(int(ENV_KW.get("max_steps", data.shape[0]-1)), int(data.shape[0]-1))}
+    # --- Probe true dims from the actual env (dynamic-filtered kwargs) ---
+    probe_kw = {
+        "numeric_data": train_data,
+        "time_data": train_time_data,
+        **TRAIN_ENV_KW,
+        "max_steps": min(int(TRAIN_ENV_KW.get("max_steps", train_data.shape[0]-1)), int(train_data.shape[0]-1)),
+    }
     state_dim, action_dim_probe = _probe_env_dims(probe_kw)
     action_dim_used = int(action_dim_probe if action_dim_probe and action_dim_probe > 0 else action_dim)
 
-    exp_dir = _find_experiment_dir(experiment_dir)
-    best_trial_dir, best_score, best_metric = _pick_best_trial_generic(exp_dir)
+    # Locate experiment directory and pick the best trial
+    exp_dir = _find_experiment_dir_ppo(experiment_dir)
+    best_trial_dir, best_score = _pick_best_trial_ppo(exp_dir)
     trial_tag = best_trial_dir.name
 
-    params = _read_trial_params(best_trial_dir)
+    # Read params (net_dims) and build cfg for inference
+    params = _read_trial_params_ppo(best_trial_dir)
     net_dims = tuple(params["net_dims"])
-    cfg = _build_cfg_for_inference_ppo(best_trial_dir, Env, int(state_dim), int(action_dim_used), net_dims)
+    cfg = _build_cfg_for_inference_ppo(
+        best_trial_dir=best_trial_dir,
+        env_class=Env,
+        state_dim=int(state_dim),
+        action_dim=int(action_dim_used),
+        net_dims=net_dims,
+    )
 
-    out_dir = Path(result_root).resolve() / trial_tag
+    # Prepare output directory: result/<trial_name>/
+    result_root_path = Path(result_root).resolve()
+    out_dir = result_root_path / trial_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df, total_return, csv_path = rollout_ppo(data, time_data, ENV_KW, cfg, csv_name=csv_name, out_dir=str(out_dir))
+    # Run rollouts (train / test) and write CSVs into the result folder
+    df_train, train_return, train_csv_path = rollout_ppo(
+        train_data, train_time_data, TRAIN_ENV_KW, cfg,
+        csv_name="train_result.csv", out_dir=str(out_dir)
+    )
+    df_test, test_return, test_csv_path = rollout_ppo(
+        test_data, test_time_data, TEST_ENV_KW, cfg,
+        csv_name="test_result.csv", out_dir=str(out_dir)
+    )
 
+    # Summary
     print("🏆 PPO Best trial:", best_trial_dir)
-    print(f"   best {best_metric}:", best_score)
-    print("   net_dims:", net_dims)
+    print("   best cum_return_max:", best_score)
+    print("   net_dims from params:", net_dims)
     print("📂 Output dir:", out_dir)
-    print(f"📈 Total return (sum rewards): {total_return:.6f}")
-    print(f"📝 File:", csv_path)
+    print(f"📈 Train return: {train_return:.6f} | Test return: {test_return:.6f}")
+    print(f"📝 Files: {train_csv_path} , {test_csv_path}")
 
     return {
         "trial_dir": str(best_trial_dir),
         "trial_tag": trial_tag,
-        "best_metric": best_metric,
-        "best_metric_value": float(best_score),
+        "best_cum_return_max": float(best_score),
         "net_dims": net_dims,
         "out_dir": str(out_dir),
-        "result": {"csv": str(csv_path), "total_return": float(total_return), "dataframe": df},
-        "cfg": cfg,
+        "train": {
+            "csv": str(train_csv_path),
+            "total_return": float(train_return),
+            "dataframe": df_train,
+        },
+        "test": {
+            "csv": str(test_csv_path),
+            "total_return": float(test_return),
+            "dataframe": df_test,
+        },
+        "cfg": cfg,  # you can reuse this cfg and its checkpoint later
     }
