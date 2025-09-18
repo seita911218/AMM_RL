@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
-from uniswap import *
+import sys
+import os
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.uniswap import *
 import tqdm
 
 import talib

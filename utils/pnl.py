@@ -110,18 +110,14 @@ def pnl_fix_range(data, L,gas,width=0.05):
             lvr = LVR(price_in, price_out, L)
         price_l,price_r= set_LP_range(price_in,width)
         # prepare Y(USDC) token as ini cap, borrowing X(WETH)
-        ini_cap=L*((price_in)**(1/2) -(price_l)**(1/2) )
-
-        if close_price>=price_in:
-            swap_fee_total = fee_tier/(1-fee_tier)*L*(np.sqrt(close_price)-np.sqrt(price_in))
-            swap_fee_x = 0
-            swap_fee_y= swap_fee_total
-        else:
-            swap_fee_total = fee_tier/(1-fee_tier)*close_price*L*(1/np.sqrt(close_price) -1/np.sqrt(price_in))
-            swap_fee_y = 0
-            swap_fee_x= swap_fee_total
+        ini_cap=L*((price_in)**(1/2) -(price_l)**(1/2) )/10**(decimal_0-decimal_1)
+        swap_fee_x, swap_fee_y, swap_fee_total = swap_fee(
+            close_price, x_scaled_vol, y_scaled_vol, L
+        )
+        
         # Calculate reward
         reward = swap_fee_total + lvr - gas
+        # Use LP range to calculate ini cap and use volume to estimate fee
         LP_return=reward/ini_cap
         results.append({
             'time': row['time'],

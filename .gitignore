@@ -9,3 +9,5 @@ __pycache__/
 venv/
 .env
 .ipynb_checkpoints/EOF
+data/mb.csv
+data/swap_with_liq.csv
