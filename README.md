@@ -25,7 +25,6 @@ We propose a hybrid method that combines market regime detection via K-Means clu
 1. **Clone the repository**
     ```bash
     git clone https://github.com/seita911218/AMM_RL.git
-    cd FinAI_Task3
     ```
 
 2. **(Recommended) Create a virtual environment**
