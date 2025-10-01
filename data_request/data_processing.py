@@ -113,12 +113,14 @@ def features_resample(df_swap,df_mb,quote=token1,T='1h',alpha=0.05):
     
      df['interval_swap'] = df['time'].diff().dt.seconds
      df.set_index('time',inplace=True)
+     df['volume_sell'] = np.minimum(df[quote], 0)
+     df['volume_buy'] = np.maximum(df[quote] , 0)
+     df['scaled_volume_buy'] = df['volume_buy']/df['liquidity']
+     df['scaled_volume_sell'] = df['volume_sell']/df['liquidity']
+
      df[f'scaled_volume_{token0}'] = np.maximum(df[token0] / df['liquidity'], 0)
      df[f'scaled_volume_{token1}'] = np.maximum(df[token1] / df['liquidity'], 0)
-     if quote== token1:
-          net_vol = df[token1].copy()
-     else:
-          net_vol = df[token0].copy()
+     net_vol = df[quote].copy()
 
      total_vol = np.abs(net_vol)
      df['net_volume'] = net_vol   
@@ -129,6 +131,10 @@ def features_resample(df_swap,df_mb,quote=token1,T='1h',alpha=0.05):
      df=df.resample(T,label='right').agg({
           'net_volume':'sum' ,
           'total_volume':'sum',
+          'volume_buy':'sum',
+          'volume_sell':'sum',
+          'scaled_volume_buy':'sum',
+          'scaled_volume_sell':'sum',
           f'scaled_volume_{token0}': 'sum', 
           f'scaled_volume_{token1}': 'sum', 
           'scaled_total_volume':'sum',
@@ -140,7 +146,6 @@ def features_resample(df_swap,df_mb,quote=token1,T='1h',alpha=0.05):
             })
      df.loc[:,'net_volume'] = df['net_volume']/df['total_volume']
      df.rename(columns={'net_volume':'volume_imbalance'},inplace=True)
-     df.drop(columns=['total_volume'],inplace=True)
      hourly_ewma_R,hourly_ewm_std = ewm_features(df,alpha)
      df['R_ewma'] = hourly_ewma_R.values
 

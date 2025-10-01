@@ -11,6 +11,8 @@ from sklearn.decomposition import PCA
 
 def clustering(df_features,features_list,best_km = 3,window=24*30*2,random_state=42,IS_end='2024-01-29 19:00'):
     df = df_features.copy()
+    if IS_end is None:
+        IS_end = df.index[-1]
     df_IS = df[df.index<=IS_end].copy()
     N =len(df_IS)
     X = df_IS[features_list+['return','return_next_hr']].copy()
@@ -23,7 +25,7 @@ def clustering(df_features,features_list,best_km = 3,window=24*30*2,random_state
     df.loc[df.index[:N],['return_norm','return_next_hr_norm']] = X_proc[:,-2:]
     X_proc = X_proc[:,:-2]
 
-    if not best_km :
+    if  best_km is None:
         Ks = range(2, 11)
         kmeans_inertia, kmeans_sil = [], []
 
@@ -61,13 +63,13 @@ def clustering(df_features,features_list,best_km = 3,window=24*30*2,random_state
     
     return kmm_centers.sort_index(),df
 
-def plot_pca(df,text,n_clusters=3,random_state=42):
+def plot_pca(df,text,random_state=42):
     preprocess = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler",  StandardScaler()),
     ])
     X_proc = preprocess.fit_transform(df)
-    pca = PCA(n_components=n_clusters, random_state=random_state).fit(X_proc)
+    pca = PCA(random_state=random_state).fit(X_proc)
     coords = pca.transform(X_proc)
     df["pca1"], df["pca2"] = coords[:,0], coords[:,1]
     plt.figure(figsize=(12, 6))

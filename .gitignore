@@ -11,3 +11,7 @@ venv/
 .ipynb_checkpoints/EOF
 data/mb.csv
 data/swap_with_liq.csv
+data/hourly_features_micro_fix.csv
+df_micro.csv
+df_all.csv
+data/hourly_features_all_fix.csv
