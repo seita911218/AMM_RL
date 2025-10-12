@@ -16,3 +16,7 @@ df_micro.csv
 df_all.csv
 data/hourly_features_all_fix.csv
 data/df_CEX.csv
+data/benchmark.csv
+data/hourly_features_fix_combined.csv
+data/rollout_best_dqn.csv
+data/test.csv
