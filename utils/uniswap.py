@@ -1,5 +1,6 @@
 import json
 import os
+import math
 
 """
 Gloabl State
@@ -215,11 +216,73 @@ def LVR(price_in, price_out, L):
 #################################################################################################################################################
 #################################################################################################################################################
 
-def liquidity_multiplier(t_0, k):
+def total_y_amount_2_liquidity(total_y_amount, t_0, k):
     """
+    total_y_amount: total y amount, (float)
     t_0: current price in tick, (int)
     k: width of range, (int)
     return: unit transformation, (float)
     """
 
-    return float(1.0001 ** ((2 * t_0 + k * tickspacing) / 2)) / (2 * (1.0001 ** ((3 * t_0 + k * tickspacing) / 2) - 1.0001 ** ((3 * t_0) / 2)))
+    p_upper = tick_2_unreadable_price(tick_2_tickspacing(t_0+k))
+    p_current = tick_2_unreadable_price((t_0))
+    p_lower = tick_2_unreadable_price(tick_2_tickspacing(t_0-k))
+
+    # print(f"p_upper: {p_upper}")
+    # print(f"p_current: {p_current}")
+    # print(f"p_lower: {p_lower}")
+
+    y_ratio = (((p_current)**(1/2)-(p_lower)**(1/2))*((p_upper*p_current)**(1/2)))/(p_current*((p_upper)**(1/2)-(p_current)**(1/2))+((p_current)**(1/2)-(p_lower)**(1/2))*((p_upper*p_current)**(1/2)))
+    y = total_y_amount * y_ratio
+
+    # print(f"y_ratio: {y_ratio}")
+    # print(f"y: {y}")
+
+    R = (tick_2_tickspacing(t_0-k), t_0)
+
+    # print(f"R: {R}")
+
+    return Liquidity_from_y_amount(y, R)
+
+
+# if __name__ == "__main__":
+
+#     total = 10000
+#     p_m = 4000
+#     p_ur = 4000 * 1.05
+#     p_lr = 4000 * 0.95
+#     p_mur = transform_price_2_unreadable(p_m)
+#     p_uur = transform_price_2_unreadable(p_ur)
+#     p_lur = transform_price_2_unreadable(p_lr)
+#     y_ratio = (((p_mur)**(1/2)-(p_lur)**(1/2))*((p_uur*p_mur)**(1/2)))/(p_mur*((p_uur)**(1/2)-(p_mur)**(1/2))+((p_mur)**(1/2)-(p_lur)**(1/2))*((p_uur*p_mur)**(1/2)))
+#     x_ratio = (p_mur*((p_uur)**(1/2)-(p_mur)**(1/2)))/(p_mur*((p_uur)**(1/2)-(p_mur)**(1/2))+((p_mur)**(1/2)-(p_lur)**(1/2))*((p_uur*p_mur)**(1/2)))
+#     print(f"y_ratio: {y_ratio}")
+#     print(f"x_ratio: {x_ratio}")
+
+#     y = 15000*y_ratio
+#     y_ur = transform_y_amount_2_unreadable(y)
+#     p_m = 4000
+#     p_ur = 4000 * 1.05
+#     p_lr = 4000 * 0.95
+#     p_mur = transform_price_2_unreadable(p_m)
+#     p_uur = transform_price_2_unreadable(p_ur)
+#     p_lur = transform_price_2_unreadable(p_lr)
+#     R = (math.log(p_lur, 1.0001), math.log(p_mur, 1.0001))
+#     print(f"y_amount: {y_ur}")
+#     print(f"range: {R}")
+#     print(f"Liquidity from y: {Liquidity_from_y_amount(y, R)}")
+     
+#     x = 15000/p_m*x_ratio
+#     x_ur = transform_x_amount_2_unreadable(x)
+#     p_ur = 4000 * 1.05
+#     p_lr = 4000 * 0.95
+#     p_mur = transform_price_2_unreadable(p_m)
+#     p_uur = transform_price_2_unreadable(p_ur)
+#     p_lur = transform_price_2_unreadable(p_lr)
+#     R = (math.log(p_mur, 1.0001), math.log(p_uur, 1.0001))
+#     print(f"x_amount: {x_ur}")
+#     print(f"range: {R}")
+#     print(f"Liquidity from x: {Liquidity_from_x_amount(x, R)}")
+
+
+
