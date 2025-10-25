@@ -118,14 +118,6 @@ def pnl_fix_range(data, L,gas,width=0.05):
         swap_fee_x, swap_fee_y, swap_fee_total = swap_fee(
             close_price, x_scaled_vol, y_scaled_vol, L
         )
-        # if close_price>=price_in:
-        #     swap_fee_total = fee_tier/(1-fee_tier)*L*(np.sqrt(close_price)-np.sqrt(price_in))
-        #     swap_fee_x = 0
-        #     swap_fee_y= swap_fee_total
-        # else:
-        #     swap_fee_total = fee_tier/(1-fee_tier)*close_price*L*(1/np.sqrt(close_price) -1/np.sqrt(price_in))
-        #     swap_fee_y = 0
-        #     swap_fee_x= swap_fee_total
         # Calculate reward
         reward = swap_fee_total + lvr - gas
         LP_return=reward/ini_cap

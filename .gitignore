@@ -20,3 +20,5 @@ data/benchmark.csv
 data/hourly_features_fix_combined.csv
 data/rollout_best_dqn.csv
 data/test.csv
+*.csv
+*.jpg

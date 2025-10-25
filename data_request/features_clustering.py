@@ -8,7 +8,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.decomposition import PCA
-
+IS_end='2024-01-29 19:00'
 def clustering(df_features,features_list,best_km = 3,window=24*30*2,random_state=42,IS_end='2024-01-29 19:00'):
     df = df_features.copy()
     if IS_end is None:
@@ -62,7 +62,20 @@ def clustering(df_features,features_list,best_km = 3,window=24*30*2,random_state
     kmm_centers.index =[ label_map[i] for i in kmm_centers.index]
     
     return kmm_centers.sort_index(),df
+def n_cluster_corr_pick(df,feature_list,IS_end=IS_end,max_k=20):
+    max_cor=0
+    for k in range(2,max_k):
+        km_pca,df_pca = clustering(df,feature_list,best_km=k,IS_end=IS_end)
+        # in sample label-return correlation
+        cor = df_pca[df_pca.index<=IS_end][['return_next_hr','km_label']].corr().iloc[1,0]
+        if cor>max_cor:
+            max_cor=cor
+            best_k =k
+            km_max=km_pca
+            df_max=df_pca
+    print(f'k={best_k},cor={max_cor}')
 
+    return km_max,df_max
 def plot_pca(df,text,random_state=42):
     preprocess = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -168,3 +181,87 @@ def plot_regime_boxplot(df,text,col='return_next_hr_norm',outlier_pct=True,y_lim
 
         for label, pct in outlier_pct_dict.items():
             print(f"Regime {label}: Outlier {pct:.2f}%")
+
+def regime_stats(df,IS_end=IS_end,reward='reward_next_hr',label='km_label'):
+    df_IS=df[df.index<=IS_end].copy()
+    cor_IS= df_IS[[reward,label]].corr().iloc[1,0]
+    stats_IS=df_IS.groupby(label)[reward].agg(
+        mean_IS='mean',std_IS='std',
+        sharpe_annual_IS=lambda x: (x.mean()/x.std())*np.sqrt(365*24) if x.std()!=0 else 0,
+        fraction_IS=lambda x: len(x)/len(df_IS))
+    
+    df_OS=df[df.index>IS_end].copy()
+    cor_OS= df_OS[[reward,label]].corr().iloc[1,0]
+    stats_OS=df_OS.groupby(label)[reward].agg(
+        mean_OS='mean',std_OS='std',
+        sharpe_annual_OS=lambda x: (x.mean()/x.std())*np.sqrt(365*24) if x.std()!=0 else 0,
+        fraction_OS=lambda x: len(x)/len(df_OS))
+    print(f"label vs {reward}, IS cor:{cor_IS}, OS cor:{cor_OS}")
+
+    return cor_IS,cor_OS, pd.concat([stats_IS,stats_OS],axis=1)
+
+
+def calc_performance_metrics(result,reward='pnl',equity='equity', IS_end=IS_end):
+
+    def compute_metrics(df):
+        mean_pnl = df[reward].mean()
+        std_pnl = df[reward].std()
+        skew_pnl = df[reward].skew()
+        kurt_pnl = df[reward].kurtosis()
+        win_rate = (df[reward] > 0).mean()
+
+        running_max = df[equity].cummax()
+        drawdown =  (df[equity]-running_max)/running_max
+        max_drawdown = drawdown.min()
+        sharpe_annual = (mean_pnl / std_pnl) * np.sqrt(365 * 24) if std_pnl != 0 else 0
+
+        return [
+            mean_pnl,
+            std_pnl,
+            skew_pnl,
+            kurt_pnl,
+            win_rate,
+            max_drawdown,
+            sharpe_annual
+        ]
+
+    IS = result[result.index<=IS_end].copy()
+    OS =  result[result.index>IS_end].copy()
+
+    metrics = [
+        'Reward Mean',
+        'Reward Std',
+        'Reward Skew',
+        'Reward Kurtosis',
+        'LP Win Rate',
+        'Max Drawdown',
+        'Sharpe_annual'
+
+    ]
+
+    IS_values = compute_metrics(IS)
+    OS_values = compute_metrics(OS)
+
+    performance_df = pd.DataFrame(
+        {'In Sample': IS_values, 'Out Sample': OS_values},
+        index=metrics
+    )
+
+
+
+    def fmt(x, row):
+        if row == 'Max Drawdown':
+            return f"{x * 100:.2f}%"  
+        elif isinstance(x, (int, float)):
+            return f"{x:,.3f}"
+        else:
+            return x
+
+    performance_df = performance_df.apply(
+        lambda col: [fmt(val, idx) for idx, val in zip(performance_df.index, col)],
+        axis=0,
+        result_type='expand'
+    )
+    performance_df.index = metrics
+
+    return performance_df
